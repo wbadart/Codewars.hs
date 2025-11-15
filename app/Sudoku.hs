@@ -1,97 +1,148 @@
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE TypeApplications #-}
+
 module Sudoku where
 
-import Data.Function ((&))
-import Data.Functor ((<&>))
-import Data.List (groupBy, sortOn)
-import Data.Map.Strict (Map, (!))
-import qualified Data.Map.Strict as Map
+import Data.List (minimumBy, transpose)
+import Data.Ord (comparing)
+import Data.Set (Set, (\\))
+import qualified Data.Set as Set
 
 
 -- Main API
 -- ==========
 
 sudoku :: [[Int]] -> [[Int]]
-sudoku = toInput . head . solve . fromInput
+sudoku = boardRows . head . solve (Set.fromList [1 .. 9]) 0 . denormalize
 
 
--- Config
+-- Data structures
 -- ==========
 
-squareLength :: Int
-squareLength = 3
+data Board a = Board
+  { boardZones :: Zones a
+  , boardRows  :: [[a]]
+  }
+  deriving Show
 
-boardLength :: Int
-boardLength = squareLength * squareLength
+data Zones a = Zones
+  { zoneRows :: [Set a]
+  , zoneCols :: [Set a]
+  , zoneSqs  :: [Set a]
+  }
+  deriving Show
 
+type Pos = (Int, Int)
 
--- Data
--- ==========
+denormalize :: [[Int]] -> Board Int
+denormalize board = Board
+  { boardZones = Zones
+    { zoneRows = Set.filter (/= 0) . Set.fromList <$> board
+    , zoneCols = Set.filter (/= 0) . Set.fromList <$> transpose board
+    , zoneSqs  = Set.filter (/= 0) . Set.fromList <$> squares board
+    }
+  , boardRows = board
+  }
 
-type Board a = Map Coord a
-type Coord = (Int, Int)
+squares :: [[a]] -> [[a]]
+squares board =
+  let
+    boardSize = length board
+    numSqs = floor @Double (sqrt $ fromIntegral boardSize)
+  in
+    [ square board numSqs i j
+    | i <- [0 .. numSqs - 1]
+    , j <- [0 .. numSqs - 1]
+    ]
 
-fromInput :: [[a]] -> Board a
-fromInput board = Map.fromList [(pos, board !! i !! j) | pos@(i, j) <- coords]
-
-toInput :: Board a -> [[a]]
-toInput board =
-  Map.toList board
-  & groupBy (\((rowA, _), _) ((rowB, _), _) -> rowA == rowB)
-  <&> sortOn (\((_, col), _) -> col)
-  <&> fmap snd
+square :: [[a]] -> Int -> Int -> Int -> [a]
+square board numSqs rowIndex colIndex =
+  let
+    rowMin = numSqs * rowIndex
+    colMin = numSqs * colIndex
+  in
+    [ board !! i !! j
+    | i <- [rowMin .. rowMin + numSqs - 1]
+    , j <- [colMin .. colMin + numSqs - 1]
+    ]
 
 
 -- Algorithm
 -- ==========
 
-solve :: Board Int -> [Board Int]
-solve board = do
-  pos <- coords & filter (\pos -> board ! pos == 0)
-  candidate <- candidates board pos
-  let
-    board' = set board pos candidate
-  if done board'
-    then pure board'
-    else solve board'
+solve :: (Show a, Ord a) => Set a -> a -> Board a -> [Board a]
+solve alphabet sentinel board@Board{boardRows}
+  | done sentinel board = pure board
+  | otherwise =
+      case emptyPositions of
+        [] -> []
+        _  -> do
+          -- pick the empty position with the fewest candidates
+          let bestPos = minimumBy (comparing (length . candidates alphabet board)) emptyPositions
+          candidate <- candidates alphabet board bestPos
+          let board' = set bestPos candidate board
+          if done sentinel board'
+            then pure board'
+            else solve alphabet sentinel board'
+      where
+        emptyPositions = filter (\(i, j) -> boardRows !! i !! j == sentinel) (coords board)
+
+coords :: Board a -> [Pos]
+coords Board{boardRows=board} =
+  let boardSize = length board
+  in [(i, j) | i <- [0 .. boardSize - 1], j <- [0 .. boardSize - 1]]
+
+candidates :: Ord a => Set a -> Board a -> Pos -> [a]
+candidates alphabet Board{boardZones, boardRows} pos@(rowIndex, colIndex) =
+  Set.toList
+    $ alphabet
+    \\ Set.unions
+      [ zoneRows boardZones !! rowIndex
+      , zoneCols boardZones !!  colIndex
+      , zoneSqs boardZones !! sqIndex (length boardRows) pos
+      ]
 
 
-candidates :: Board Int -> Coord -> [Int]
-candidates board pos@(rowIndex, colIndex) = filter rules alphabet
-  where
-    rules :: Int -> Bool
-    rules val = uniqRow val && uniqCol val && uniqSquare val
-
-    uniqRow, uniqCol, uniqSquare :: Int -> Bool
-    uniqRow    val = val `notElem` row rowIndex board
-    uniqCol    val = val `notElem` col colIndex board
-    uniqSquare val = val `notElem` square pos board
-
-    alphabet :: [Int]
-    alphabet = [1 .. boardLength]
+zone :: Board a -> Pos -> [Set a]
+zone Board{boardZones, boardRows} pos@(rowIndex, colIndex) =
+  [ zoneRows boardZones !! rowIndex
+  , zoneCols boardZones !! colIndex
+  , zoneSqs boardZones !! sqIndex (length boardRows) pos
+  ]
 
 
-done :: Board Int -> Bool
-done board = 0 `notElem` Map.elems board
+set :: Ord a => Pos -> a -> Board a -> Board a
+set pos@(rowIndex, colIndex) a Board{boardZones, boardRows} = Board
+  { boardZones = Zones
+    { zoneRows = updateList rowIndex (Set.insert a) (zoneRows boardZones)
+    , zoneCols = updateList colIndex (Set.insert a) (zoneCols boardZones)
+    , zoneSqs  = updateList (sqIndex (length boardRows) pos) (Set.insert a) (zoneSqs boardZones)
+    }
+  , boardRows = updateList rowIndex (updateList colIndex (const a)) boardRows
+  }
+
+
+done :: Eq a => a -> Board a -> Bool
+done sentinel Board{boardRows} = sentinel `notElem` concat boardRows
 
 
 -- Helpers
 -- ==========
 
-coords :: [Coord]
-coords = [(i, j) | i <- [0 .. boardLength - 1], j <- [0 .. boardLength -1]]
-
-set :: Board a -> Coord -> a -> Board a
-set board pos val = Map.insert pos val board
-
-row, col :: Int -> Board a -> [a]
-row i = Map.elems . Map.filterWithKey (\(rowIndex, _) _ -> rowIndex == i)
-col j = Map.elems . Map.filterWithKey (\(_, colIndex) _ -> colIndex == j)
-
-square :: Coord -> Board a -> [a]
-square (rowIndex, colIndex) board =
+sqIndex :: Int -> Pos -> Int
+sqIndex boardSize (rowIndex, colIndex) =
   let
-    rowMin = squareLength * (rowIndex `div` squareLength)
-    rowMax = rowMin + squareLength - 1
-    colMin = squareLength * (colIndex `div` squareLength)
-    colMax = colMin + squareLength - 1
-  in [board ! (i, j) | i <- [rowMin .. rowMax], j <- [colMin .. colMax]]
+    numSqs = floor @Double (sqrt $ fromIntegral boardSize)
+    i = rowIndex `div` numSqs
+    j = colIndex `div` numSqs
+  in
+    numSqs * i + j
+
+
+updateList :: Int -> (a -> a) -> [a] -> [a]
+updateList i f xs =
+  let
+    (left, right) = splitAt i xs
+    x = xs !! i
+  in
+    left <> (f x : drop 1 right)
